@@ -1,0 +1,23 @@
+# Core Web Framework
+fastapi
+uvicorn[standard]
+
+# Google Gemini
+google-generativeai
+
+# Data Validation & Settings
+pydantic
+python-dotenv
+
+# Document Processing & Retrieval
+pymupdf              # Faster than PyPDF for text extraction
+unstructured         # For advanced, policy-aware chunking logic
+sentence-transformers
+rank_bm25
+faiss-cpu            # CPU version for easy installation
+
+# Async HTTP Client
+httpx
+
+# UI for Demo
+streamlit
