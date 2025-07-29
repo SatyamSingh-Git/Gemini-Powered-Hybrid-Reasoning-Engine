@@ -1,3 +1,5 @@
+# src/reasoning_engine/core/agent.py (THE LEAN, EFFICIENT, WINNING VERSION)
+
 import google.generativeai as genai
 from typing import List, Dict, Any
 import logging
@@ -21,12 +23,20 @@ except Exception as e:
 class ReasoningAgent:
     def __init__(self, retriever: HybridRetriever):
         self.retriever = retriever
-        self.model = genai.GenerativeModel('gemini-2.5_flash', tools=list(AVAILABLE_TOOLS.values()))
+        self.model = genai.GenerativeModel('gemini-2.5-flash', tools=list(AVAILABLE_TOOLS.values()))
         self.query_gen_model = genai.GenerativeModel('gemini-2.5-flash')
+
+    def _convert_proto_to_dict(self, proto_obj: Any) -> Any:
+        if hasattr(proto_obj, 'items'):
+            return {key: self._convert_proto_to_dict(value) for key, value in proto_obj.items()}
+        elif hasattr(proto_obj, '__iter__') and not isinstance(proto_obj, (str, bytes)):
+            return [self._convert_proto_to_dict(item) for item in proto_obj]
+        else:
+            return proto_obj
 
     def _execute_tool_call(self, tool_call, chunks) -> List[Dict[str, Any]]:
         tool_name = tool_call.name
-        tool_args = {key: value for key, value in tool_call.args.items()}
+        tool_args = self._convert_proto_to_dict(tool_call.args)
         if tool_name in AVAILABLE_TOOLS:
             logger.info(f"EXECUTOR: Calling tool '{tool_name}' with args: {tool_args}")
             tool_function = AVAILABLE_TOOLS[tool_name]
@@ -38,118 +48,87 @@ class ReasoningAgent:
         return [{"error": f"Tool '{tool_name}' not found."}]
 
     async def _generate_multiple_queries(self, query: str) -> List[str]:
-        """Uses an LLM to generate a variety of search queries from a single user question."""
         prompt = f"""
-        You are a world-class research analyst. Your task is to generate 3 diverse, complementary search queries based on the user's question to ensure comprehensive document retrieval.
-        The queries should be phrased differently to cover various aspects, keywords, and potential document sections.
-        For example, for "What is the waiting period for maternity expenses?", good queries would be:
-        ["maternity expense coverage waiting period", "policy exclusions for childbirth and pregnancy", "conditions for maternity benefits"].
+        Generate 3 diverse, complementary search queries based on the user's question.
         Provide the output as a JSON list of strings.
-
         User question: "{query}"
         """
         try:
             response = await self.query_gen_model.generate_content_async(prompt)
-            # A robust way to clean potential markdown formatting from the LLM response
             json_text = response.text.strip().lstrip("```json").rstrip("```")
             queries = json.loads(json_text)
-            queries.append(query)  # Always include the original query as a baseline
+            queries.append(query)
             logger.info(f"Generated search queries: {queries}")
-            return list(set(queries))  # Use set to ensure queries are unique
+            return list(set(queries))
         except Exception as e:
             logger.warning(f"Multi-query generation failed: {e}. Falling back to original query.")
             return [query]
 
     async def answer_question(self, query: str) -> Answer:
-        logger.info(f"--- Starting Multi-Query Super-Analyst process for question: '{query}' ---")
+        logger.info(f"--- Starting Lean Super-Analyst process for question: '{query}' ---")
 
         # ==============================================================================
-        # PHASE 1: MULTI-QUERY RETRIEVAL
+        # PHASE 1: MULTI-QUERY RETRIEVAL (LLM CALL #1)
         # ==============================================================================
         search_queries = await self._generate_multiple_queries(query)
-
-        retrieval_tasks = [self.retriever.retrieve(sq, top_k=5) for sq in search_queries]
-        all_retrieved_chunks_lists = await asyncio.gather(*retrieval_tasks)
-
-        unique_chunks = {chunk.chunk_id: chunk for sublist in all_retrieved_chunks_lists for chunk in sublist}
+        all_retrieved_chunks = []
+        for sq in search_queries:
+            chunks_for_query = self.retriever.retrieve(sq, top_k=5)
+            all_retrieved_chunks.extend(chunks_for_query)
+        unique_chunks = {chunk.chunk_id: chunk for chunk in all_retrieved_chunks}
         retrieved_chunks = list(unique_chunks.values())
-        logger.info(f"Retrieved a total of {len(retrieved_chunks)} unique chunks from {len(search_queries)} queries.")
+        logger.info(f"Retrieved {len(retrieved_chunks)} unique chunks from {len(search_queries)} queries.")
 
         # ==============================================================================
-        # PHASE 2: THE PLANNER
+        # PHASE 2: TOOL-USE AND SYNTHESIS (LLM CALL #2)
         # ==============================================================================
-        planning_prompt = f"""
-        You are a meticulous research planner. Your task is to create a step-by-step plan to answer the user's question about an insurance policy.
-        Each step in your plan MUST be a call to one of the available tools.
-        Think step-by-step to break down the user's query into the necessary tool calls.
-        Examples:
-        For "What is the waiting period for pre-existing diseases?", a good plan is:
-        1. Call `check_waiting_period` with procedure_terms=["pre-existing diseases"].
-        For "How does the policy define a 'Hospital'?", a good plan is:
-        1. Call `find_information` with topic="definition of a hospital".
+        system_prompt = f"""
+        You are a precise, fact-based insurance policy analyst. Your SOLE purpose is to answer the user's question based ONLY on the output of functions you call.
 
-        User Question: "{query}"
-        Create the research plan now.
+        Your workflow is as follows:
+        1.  Based on the user's question, call the single most appropriate tool to find the specific data required.
+        2.  You will then receive the output from that tool.
+        3.  Based ONLY on the data returned by the tool, formulate a comprehensive, professional, single-paragraph answer to the original user question.
+        4.  If the tool output is empty or contains an error, you MUST state that the information could not be found in the provided policy documents.
+
+        **CRITICAL RULES:**
+        - DO NOT ask for more information.
+        - DO NOT apologize.
+        - DO NOT say "Please provide the document."
+        - Answer ONLY from the tool's output.
         """
 
         chat_session = self.model.start_chat()
-        plan_response = await chat_session.send_message_async(planning_prompt)
+        initial_message = f"{system_prompt}\n\n**User Question:** {query}"
 
-        # ==============================================================================
-        # PHASE 3: THE EXECUTOR
-        # ==============================================================================
-        gathered_evidence = []
-        try:
-            plan_tool_calls = plan_response.candidates[0].content.parts
-            logger.info(f"PLANNER: Generated a plan with {len(plan_tool_calls)} steps.")
+        response = await chat_session.send_message_async(initial_message)
+        response_part = response.candidates[0].content.parts[0]
 
-            for part in plan_tool_calls:
-                if not part.function_call: continue
+        final_answer_text = f"The information for '{query}' could not be determined."
 
-                tool_call = part.function_call
-                tool_results = self._execute_tool_call(tool_call, retrieved_chunks)
+        if response_part.function_call:
+            tool_call = response_part.function_call
+            tool_results = self._execute_tool_call(tool_call, retrieved_chunks)
+            logger.info(f"Tool '{tool_call.name}' returned: {json.dumps(tool_results, indent=2)}")
 
-                if tool_results and "error" not in tool_results[0]:
-                    gathered_evidence.append({
-                        "step_executed": tool_call.name,
-                        "parameters": {key: value for key, value in tool_call.args.items()},
-                        "evidence_found": tool_results
-                    })
-        except (ValueError, IndexError) as e:
-            logger.error(f"PLANNER: Could not parse a valid plan from the model's response. Error: {e}")
-            gathered_evidence.append({"error": "Failed to create a valid research plan."})
+            if tool_results and "error" not in tool_results[0]:
+                synthesis_response = await chat_session.send_message_async(
+                    genai.protos.FunctionResponse(name=tool_call.name, response={"result": tool_results})
+                )
+                final_answer_text = synthesis_response.text.strip()
+        else:
+            # If the model doesn't call a tool, it's because it thinks it can answer from the prompt (which we forbid).
+            # This is a fallback to prevent it from refusing to use tools.
+            final_answer_text = "The model did not select a tool to answer the question, so a definitive answer could not be determined."
 
-        # ==============================================================================
-        # PHASE 4: THE SYNTHESIZER
-        # ==============================================================================
-        synthesis_prompt = f"""
-        You are an expert insurance analyst. Your final and only job is to synthesize the following collected research evidence into a single, comprehensive, and professional paragraph.
-        The user's original question was: "{query}"
-
-        Here is the evidence dossier you have gathered:
-        ---
-        {json.dumps(gathered_evidence, indent=2)}
-        ---
-
-        Based ONLY on the evidence in the dossier, write the definitive final answer.
-        - If the evidence contains the answer, state it directly and confidently.
-        - **If the evidence seems incomplete, synthesize what you can and note what is missing. For example, if you find the definition of AYUSH but not the coverage limit, state the definition and then say the specific coverage limit could not be determined.**
-        - If the evidence is empty or contains errors, you MUST state that the information could not be found in the provided policy documents.
-        - Do not apologize, do not ask for more information, and do not refuse to answer.
-        """
-
-        final_response = await self.model.generate_content_async(synthesis_prompt)
-        final_answer_text = final_response.text.strip()
-
-        logger.info(f"SYNTHESIZER: Generated final answer: {final_answer_text}")
+        logger.info(f"Generated simple answer: {final_answer_text}")
         return Answer(query=query, decision="Information Found", payout=None, justification=[],
                       simple_answer=final_answer_text)
 
     async def answer_all_questions(self, questions: List[str]) -> List[Answer]:
-        """Processes a list of questions sequentially for maximum stability."""
         answers = []
         for query in questions:
             answer = await self.answer_question(query)
             answers.append(answer)
-            await asyncio.sleep(1.5)  # A safe delay to manage API rate limits
+            await asyncio.sleep(1.5)
         return answers

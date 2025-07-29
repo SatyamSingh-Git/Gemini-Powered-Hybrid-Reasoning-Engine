@@ -1,5 +1,5 @@
-from pydantic import BaseModel, Field, HttpUrl
-from typing import List, Optional
+from pydantic import BaseModel, Field, HttpUrl, field_validator
+from typing import List, Optional, Union # <-- Import Union and field_validator
 
 # ==============================================================================
 # 1. API Request/Response Models (External Contract)
@@ -8,22 +8,30 @@ from typing import List, Optional
 class APIRequest(BaseModel):
     """
     Defines the structure of the incoming request to the /hackrx/run endpoint.
+    This version is now flexible to handle the official hackathon format.
     """
-    documents: List[HttpUrl] = Field(
+    # THE FIX IS HERE: Change List[HttpUrl] to Union[List[HttpUrl], HttpUrl]
+    # This tells Pydantic to accept EITHER a single URL string OR a list of them.
+    documents: Union[List[HttpUrl], HttpUrl] = Field(
         ...,
-        description="A list of URLs pointing to the PDF documents to be processed.",
-        examples=[
-            "https://hackrx.blob.core.windows.net/assets/policy.pdf?sv=2023-01-03&st=..."
-        ],
+        description="A list of URLs or a single URL pointing to the PDF documents to be processed.",
     )
     questions: List[str] = Field(
         ...,
         description="A list of natural language questions to be answered based on the documents.",
-        examples=[
-            "What is the grace period for premium payment?",
-            "What is the waiting period for pre-existing diseases?",
-        ],
     )
+
+    # This is a "safety net" validator. It runs before any other validation.
+    # It ensures that no matter what the input is, the rest of our code will
+    # ALWAYS receive the 'documents' field as a list.
+    @field_validator('documents', mode='before')
+    @classmethod
+    def ensure_documents_is_list(cls, v):
+        if isinstance(v, str):
+            # If a single string URL is passed, wrap it in a list.
+            return [v]
+        # If it's already a list, do nothing.
+        return v
 
 
 class Evidence(BaseModel):
@@ -83,8 +91,6 @@ class APIResponse(BaseModel):
     The final, structured response returned by the API. The top-level key 'answers'
     matches the sample, but the content is structured for explainability.
     """
-    # For the final submission, we can choose to return List[Answer] or List[str]
-    # by selecting the appropriate field in the response model.
     answers: List[str]
 
 
