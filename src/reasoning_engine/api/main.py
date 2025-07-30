@@ -1,28 +1,45 @@
-# src/reasoning_engine/api/main.py (SIMPLIFIED AND CORRECTED)
+# src/reasoning_engine/api/main.py (UPGRADED FOR WINDOWS WITH WINLOOP)
 
 from fastapi import FastAPI
 import logging
+from contextlib import asynccontextmanager
+import redis.asyncio as aioredis
+import winloop  # Import winloop instead of uvloop
+import asyncio
 
 from .routes import router as api_router
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Manages application startup and shutdown events."""
+    # Startup: Create a Redis connection pool.
+    logging.info("Application starting up...")
+    app.state.redis = aioredis.from_url("redis://localhost", encoding="utf-8", decode_responses=True)
+
+    # Install winloop as the asyncio event loop policy.
+    winloop.install()
+
+    logging.info("Redis connection established and winloop is active.")
+    yield
+    # Shutdown: Close the Redis connection pool.
+    logging.info("Application shutting down...")
+    await app.state.redis.close()
+    logging.info("Redis connection closed.")
+
 
 app = FastAPI(
-    title="HackRx Gemini Reasoning Engine API",
-    description="An API for querying and making decisions on policy documents.",
-    version="1.0.0",
+    title="HackRx Optimized Gemini Reasoning Engine",
+    description="A high-performance RAG API with caching and optimized processing for Windows.",
+    version="2.0.1",  # Version bump for the fix
+    lifespan=lifespan,
 )
 
-# Include the API router that defines the /hackrx/run endpoint
 app.include_router(api_router)
+
 
 @app.get("/", tags=["Health"])
 async def read_root():
-    """
-    A simple health check endpoint to confirm the API is running.
-    """
-    return {"status": "ok", "message": "Welcome to the Reasoning Engine API!"}
+    return {"status": "ok", "message": "Welcome to the Optimized Reasoning Engine API!"}

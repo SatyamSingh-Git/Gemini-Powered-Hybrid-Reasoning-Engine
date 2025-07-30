@@ -1,10 +1,12 @@
-# src/reasoning_engine/core/agent.py (THE LEAN, EFFICIENT, WINNING VERSION)
+# src/reasoning_engine/core/agent.py (THE FINAL "DISTILLER-ANALYST" AGENT)
+import re
 
 import google.generativeai as genai
 from typing import List, Dict, Any
 import logging
 import json
 import asyncio
+import hashlib
 
 from ..config import get_settings
 from .models import DocumentChunk, Answer
@@ -21,25 +23,29 @@ except Exception as e:
 
 
 class ReasoningAgent:
-    def __init__(self, retriever: HybridRetriever):
+    def __init__(self, retriever: HybridRetriever, redis_client):
         self.retriever = retriever
-        self.model = genai.GenerativeModel('gemini-2.5-flash', tools=list(AVAILABLE_TOOLS.values()))
-        self.query_gen_model = genai.GenerativeModel('gemini-2.5-flash')
+        self.redis = redis_client
+        self.reasoning_model = genai.GenerativeModel('gemini-2.5-flash', tools=list(AVAILABLE_TOOLS.values()))
+        self.fast_model = genai.GenerativeModel('gemini-2.5-flash')
 
-    def _convert_proto_to_dict(self, proto_obj: Any) -> Any:
-        if hasattr(proto_obj, 'items'):
-            return {key: self._convert_proto_to_dict(value) for key, value in proto_obj.items()}
-        elif hasattr(proto_obj, '__iter__') and not isinstance(proto_obj, (str, bytes)):
-            return [self._convert_proto_to_dict(item) for item in proto_obj]
-        else:
-            return proto_obj
+    def _get_cache_key(self, content: str) -> str:
+        return f"gemini-cache:{hashlib.md5(content.encode()).hexdigest()}"
+
+    def _deterministic_query_expansion(self, query: str) -> List[str]:
+        variants = {query};
+        keywords = [word.lower() for word in query.split() if
+                    len(word) > 3 and word.lower() not in ['what', 'is', 'are', 'the', 'for', 'a', 'an']];
+        if keywords: variants.add(' '.join(keywords))
+        if 'define' in query.lower() or 'what is' in query.lower(): variants.add(f"definition of {' '.join(keywords)}");
+        return list(variants)
 
     def _execute_tool_call(self, tool_call, chunks) -> List[Dict[str, Any]]:
-        tool_name = tool_call.name
-        tool_args = self._convert_proto_to_dict(tool_call.args)
+        tool_name = tool_call.name;
+        tool_args = dict(tool_call.args)
         if tool_name in AVAILABLE_TOOLS:
             logger.info(f"EXECUTOR: Calling tool '{tool_name}' with args: {tool_args}")
-            tool_function = AVAILABLE_TOOLS[tool_name]
+            tool_function = AVAILABLE_TOOLS[tool_name];
             tool_args['clauses'] = chunks
             try:
                 return tool_function(**tool_args)
@@ -47,81 +53,126 @@ class ReasoningAgent:
                 return [{"error": f"Error executing tool: {e}"}]
         return [{"error": f"Tool '{tool_name}' not found."}]
 
-    async def _generate_multiple_queries(self, query: str) -> List[str]:
-        prompt = f"""
-        Generate 3 diverse, complementary search queries based on the user's question.
-        Provide the output as a JSON list of strings.
-        User question: "{query}"
+    async def _distill_evidence(self, query: str, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """Uses a fast LLM to find the single best chunk of evidence."""
+        if not chunks:
+            return []
+
+        context_str = "\n---\n".join([f"ID: {i}\n{chunk.text}" for i, chunk in enumerate(chunks)])
+
+        distillation_prompt = f"""
+        You are a research assistant. Your task is to review the following text chunks, which are separated by '---'.
+        Based on the user's question, identify the SINGLE chunk ID that contains the most direct and precise answer.
+        Respond with ONLY the numeric ID of that single best chunk.
+
+        User Question: "{query}"
+
+        <EVIDENCE>
+        {context_str}
+        </EVIDENCE>
         """
         try:
-            response = await self.query_gen_model.generate_content_async(prompt)
-            json_text = response.text.strip().lstrip("```json").rstrip("```")
-            queries = json.loads(json_text)
-            queries.append(query)
-            logger.info(f"Generated search queries: {queries}")
-            return list(set(queries))
-        except Exception as e:
-            logger.warning(f"Multi-query generation failed: {e}. Falling back to original query.")
-            return [query]
+            response = await self.fast_model.generate_content_async(distillation_prompt)
+            best_chunk_id_str = response.text.strip()
+            best_chunk_id = int(re.search(r'\d+', best_chunk_id_str).group())
+            logger.info(f"DISTILLER: Identified best evidence chunk ID: {best_chunk_id}")
+            return [chunks[best_chunk_id]]
+        except (ValueError, IndexError, AttributeError) as e:
+            logger.warning(f"DISTILLER: Could not distill evidence, falling back to all chunks. Error: {e}")
+            return chunks  # Fallback to using all chunks if distillation fails
 
     async def answer_question(self, query: str) -> Answer:
-        logger.info(f"--- Starting Lean Super-Analyst process for question: '{query}' ---")
+        logger.info(f"--- Starting Distiller-Analyst process for question: '{query}' ---")
 
-        # ==============================================================================
-        # PHASE 1: MULTI-QUERY RETRIEVAL (LLM CALL #1)
-        # ==============================================================================
-        search_queries = await self._generate_multiple_queries(query)
-        all_retrieved_chunks = []
-        for sq in search_queries:
-            chunks_for_query = self.retriever.retrieve(sq, top_k=5)
-            all_retrieved_chunks.extend(chunks_for_query)
-        unique_chunks = {chunk.chunk_id: chunk for chunk in all_retrieved_chunks}
-        retrieved_chunks = list(unique_chunks.values())
-        logger.info(f"Retrieved {len(retrieved_chunks)} unique chunks from {len(search_queries)} queries.")
+        final_answer_key = self._get_cache_key(f"final_answer:{query}")
+        cached_answer = await self.redis.get(final_answer_key)
+        if cached_answer:
+            logger.info("CACHE HIT: Returning final answer from cache.")
+            return Answer(query=query, decision="Information Found (Cached)", payout=None, justification=[],
+                          simple_answer=cached_answer)
 
-        # ==============================================================================
-        # PHASE 2: TOOL-USE AND SYNTHESIS (LLM CALL #2)
-        # ==============================================================================
-        system_prompt = f"""
-        You are a precise, fact-based insurance policy analyst. Your SOLE purpose is to answer the user's question based ONLY on the output of functions you call.
+        # Phase 1: Broad Retrieval
+        search_queries = self._deterministic_query_expansion(query)
+        all_retrieved_chunks = [chunk for sq in search_queries for chunk in self.retriever.retrieve(sq, top_k=5)]
+        unique_chunks = list({chunk.chunk_id: chunk for chunk in all_retrieved_chunks}.values())
 
-        Your workflow is as follows:
-        1.  Based on the user's question, call the single most appropriate tool to find the specific data required.
-        2.  You will then receive the output from that tool.
-        3.  Based ONLY on the data returned by the tool, formulate a comprehensive, professional, single-paragraph answer to the original user question.
-        4.  If the tool output is empty or contains an error, you MUST state that the information could not be found in the provided policy documents.
+        # Phase 2: Evidence Distillation
+        distilled_evidence = await self._distill_evidence(query, unique_chunks)
 
-        **CRITICAL RULES:**
-        - DO NOT ask for more information.
-        - DO NOT apologize.
-        - DO NOT say "Please provide the document."
-        - Answer ONLY from the tool's output.
-        """
+        # Phase 3: Focused Analysis (Planner, Executor, Synthesizer)
+        planning_prompt = f"""
+                        You are a meticulous and logical research planner. Your task is to create a step-by-step plan to answer the user's question about an insurance policy. Your plan must consist of a sequence of tool calls.
 
-        chat_session = self.model.start_chat()
-        initial_message = f"{system_prompt}\n\n**User Question:** {query}"
+                        **Instructions:**
+                        1.  Analyze the user's question to understand the core intent and identify all key entities (e.g., "pre-existing diseases", "room rent", "Plan A").
+                        2.  Select the single most specific tool that can answer the question.
+                        3.  Construct the arguments for the tool using the entities you identified.
+                        4.  Prioritize the most specific tool. Only use `find_information` for general definitions or when no other tool fits.
 
-        response = await chat_session.send_message_async(initial_message)
-        response_part = response.candidates[0].content.parts[0]
+                        **High-Quality Examples:**
 
-        final_answer_text = f"The information for '{query}' could not be determined."
+                        **User Question:** "What is the waiting period for cataract surgery?"
+                        **Your Plan:**
+                        1.  Call `check_waiting_period` with procedure_terms=["cataract surgery", "cataract"].
 
-        if response_part.function_call:
-            tool_call = response_part.function_call
-            tool_results = self._execute_tool_call(tool_call, retrieved_chunks)
-            logger.info(f"Tool '{tool_call.name}' returned: {json.dumps(tool_results, indent=2)}")
+                        **User Question:** "How does the policy define a 'Hospital'?"
+                        **Your Plan:**
+                        1.  Call `find_information` with topic="definition of a hospital".
 
-            if tool_results and "error" not in tool_results[0]:
-                synthesis_response = await chat_session.send_message_async(
-                    genai.protos.FunctionResponse(name=tool_call.name, response={"result": tool_results})
-                )
-                final_answer_text = synthesis_response.text.strip()
-        else:
-            # If the model doesn't call a tool, it's because it thinks it can answer from the prompt (which we forbid).
-            # This is a fallback to prevent it from refusing to use tools.
-            final_answer_text = "The model did not select a tool to answer the question, so a definitive answer could not be determined."
+                        **User Question:** "Are there any sub-limits on room rent and ICU charges for Plan A?"
+                        **Your Plan:**
+                        1.  Call `extract_monetary_limit` with limit_terms=["room rent", "ICU charges", "Plan A"].
 
-        logger.info(f"Generated simple answer: {final_answer_text}")
+                        **User Question:** "{query}"
+
+                        Create the research plan now.
+                        """
+        chat_session = self.reasoning_model.start_chat()
+        plan_response = await chat_session.send_message_async(planning_prompt)
+
+        gathered_evidence = []
+        try:
+            plan_tool_calls = plan_response.candidates[0].content.parts
+            for part in plan_tool_calls:
+                if part.function_call:
+                    tool_results = self._execute_tool_call(part.function_call, distilled_evidence)
+                    if tool_results and "error" not in tool_results[0]:
+                        gathered_evidence.append({"step": part.function_call.name, "evidence": tool_results})
+        except (ValueError, IndexError):
+            gathered_evidence.append({"error": "Failed to create a valid plan."})
+
+        synthesis_prompt = f"""
+                       You are an expert insurance analyst and a master of synthesis. Your final and only job is to synthesize the provided evidence dossier into a professional, comprehensive, and definitive answer to the user's original question.
+
+                       The user's original question was:
+                       <QUESTION>
+                       {query}
+                       </QUESTION>
+
+                       Here is the evidence dossier your team has gathered:
+                       <EVIDENCE>
+                       {json.dumps(gathered_evidence, indent=2)}
+                       </EVIDENCE>
+
+                       **Your Instructions for Synthesizing the Final Answer:**
+                       1.  Synthesize a single, clear, and professional paragraph.
+                       2.  Your answer MUST be grounded *exclusively* in the provided `<EVIDENCE>`.
+                       3.  If the evidence contains specific numbers, dates, or percentages, you MUST include them in your answer.
+                       4.  If the evidence contains conflicting information, state the conflict clearly (e.g., "One clause states a 30-day period, while another specifies 24 months for this condition.").
+                       5.  If the evidence is empty or contains an error, you MUST state that the information could not be found in the provided policy documents.
+
+                       **CRITICAL RULES OF CONDUCT:**
+                       -   NEVER apologize.
+                       -   NEVER ask for more information or say "Please provide the document."
+                       -   NEVER break character. You are a professional analyst providing a definitive report.
+                       -   NEVER mention the tools, the dossier, or your internal process (e.g., "Based on the evidence...") in your final answer. Simply state the facts.
+                       """
+        final_response = await self.reasoning_model.generate_content_async(synthesis_prompt)
+        final_answer_text = final_response.text.strip()
+
+        await self.redis.set(final_answer_key, final_answer_text, ex=3600)
+
+        logger.info(f"SYNTHESIZER: Generated final answer: {final_answer_text}")
         return Answer(query=query, decision="Information Found", payout=None, justification=[],
                       simple_answer=final_answer_text)
 
@@ -130,5 +181,5 @@ class ReasoningAgent:
         for query in questions:
             answer = await self.answer_question(query)
             answers.append(answer)
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(0.5)
         return answers

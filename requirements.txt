@@ -21,3 +21,9 @@ httpx
 
 # UI for Demo
 streamlit
+
+
+#for speed
+redis # For caching
+winloop # For speed
+tqdm # For progress bars
