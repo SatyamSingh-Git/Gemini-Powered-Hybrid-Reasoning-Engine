@@ -119,10 +119,6 @@ class ReasoningAgent:
                         **Your Plan:**
                         1.  Call `find_information` with topic="definition of a hospital".
 
-                        **User Question:** "Are there any sub-limits on room rent and ICU charges for Plan A?"
-                        **Your Plan:**
-                        1.  Call `extract_monetary_limit` with limit_terms=["room rent", "ICU charges", "Plan A"].
-
                         **User Question:** "{query}"
 
                         Create the research plan now.
@@ -142,7 +138,7 @@ class ReasoningAgent:
             gathered_evidence.append({"error": "Failed to create a valid plan."})
 
         synthesis_prompt = f"""
-                       You are an expert insurance analyst and a master of synthesis. Your final and only job is to synthesize the provided evidence dossier into a professional, comprehensive, and definitive answer to the user's original question.
+                       You are an expert insurance analyst and a master of synthesis. Your final and only job is to synthesize the provided evidence dossier into a professional, direct, and definitive answer to the user's original question.
 
                        The user's original question was:
                        <QUESTION>
