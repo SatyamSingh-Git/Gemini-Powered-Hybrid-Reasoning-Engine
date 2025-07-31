@@ -27,3 +27,12 @@ streamlit
 redis # For caching
 winloop # For speed
 tqdm # For progress bars
+
+# Core multi-format parsing
+python-magic>=0.4.24
+unstructured[all-docs]>=0.14.0 # Core library with all document parsing extras
+# Dependencies for specific formats
+python-docx>=0.8.11
+openpyxl>=3.1.0
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
