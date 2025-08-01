@@ -42,8 +42,8 @@ def resilient_api_call(max_retries=5, initial_delay=1.0, backoff_factor=2.0, jit
 class ReasoningAgent:
     def __init__(self, retriever: HybridRetriever):
         self.retriever = retriever
-        self.reasoning_model = genai.GenerativeModel('gemini-1.5-pro-latest')
-        self.fast_model = genai.GenerativeModel('gemini-1.5-flash-latest')
+        self.reasoning_model = genai.GenerativeModel('gemini-2.5-flash')
+        self.fast_model = genai.GenerativeModel('gemini-2.5-flash')
 
     def _deterministic_query_expansion(self, query: str) -> List[str]:
         variants = {query};
