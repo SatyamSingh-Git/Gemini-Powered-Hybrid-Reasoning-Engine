@@ -1,33 +1,22 @@
-# src/reasoning_engine/core/agent.py (THE FINAL, RESILIENT, AND CORRECTED VERSION)
+# src/reasoning_engine/core/agent.py (THE FINAL, BUG-FREE, NO-CACHE VERSION)
 
 import google.generativeai as genai
 from typing import List, Dict, Any, Callable, Coroutine
 import logging
 import json
 import asyncio
-import hashlib
 import random
+import re
 
 from ..config import get_settings
 from .models import DocumentChunk, Answer
-from .retrievel import HybridRetriever  # Corrected import name from retrievel to retrieval
+from .retrievel import HybridRetriever
 
 logger = logging.getLogger(__name__)
 
-try:
-    settings = get_settings()
-    genai.configure(api_key=settings.google_api_key)
-except Exception as e:
-    logger.error(f"Failed to configure Gemini: {e}")
 
-
-# CRITICAL FIX: Add the resilience decorator back in to handle rate limits.
+# The resilient API call decorator is still very important!
 def resilient_api_call(max_retries=5, initial_delay=1.0, backoff_factor=2.0, jitter=0.5):
-    """
-    A decorator that makes an async function resilient to temporary API errors,
-    especially the '429 ResourceExhausted' error, using exponential backoff.
-    """
-
     def decorator(func: Callable[..., Coroutine]):
         async def wrapper(*args, **kwargs):
             delay = initial_delay
@@ -36,20 +25,14 @@ def resilient_api_call(max_retries=5, initial_delay=1.0, backoff_factor=2.0, jit
                     return await func(*args, **kwargs)
                 except Exception as e:
                     if "429" in str(e) and "ResourceExhausted" in str(e):
-                        if attempt == max_retries - 1:
-                            logger.error(f"API call failed after {max_retries} retries. Final error: {e}")
-                            raise e
-
+                        if attempt == max_retries - 1: raise e
                         wait_time = delay + random.uniform(0, jitter)
-                        logger.warning(
-                            f"Rate limit hit. Retrying in {wait_time:.2f} seconds... (Attempt {attempt + 1}/{max_retries})")
+                        logger.warning(f"Rate limit hit. Retrying in {wait_time:.2f}s...")
                         await asyncio.sleep(wait_time)
                         delay *= backoff_factor
                     else:
-                        logger.error(f"Non-retryable API error: {e}")
                         raise e
-            # This line should ideally not be reached
-            raise Exception("Retry logic failed unexpectedly.")
+            raise Exception("Retry logic failed.")
 
         return wrapper
 
@@ -57,88 +40,84 @@ def resilient_api_call(max_retries=5, initial_delay=1.0, backoff_factor=2.0, jit
 
 
 class ReasoningAgent:
-    def __init__(self, retriever: HybridRetriever, redis_client):
+    # We no longer accept a redis_client
+    def __init__(self, retriever: HybridRetriever):
         self.retriever = retriever
-        self.redis = redis_client
-        # CRITICAL FIX: Use the powerful 'pro' model for the main reasoning task.
-        # Removed the unused 'fast_model' and the 'tools' parameter.
-        self.reasoning_model = genai.GenerativeModel('gemini-2.5-flash')
-
-    def _get_cache_key(self, content: str) -> str:
-        """Creates a unique cache key for a given piece of content."""
-        return f"gemini-cache:{hashlib.md5(content.encode()).hexdigest()}"
+        self.reasoning_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        self.fast_model = genai.GenerativeModel('gemini-1.5-flash-latest')
 
     def _deterministic_query_expansion(self, query: str) -> List[str]:
-        """Generates query variants without an LLM call for token and latency savings."""
-        variants = {query}
+        variants = {query};
         keywords = [word.lower() for word in query.split() if
-                    len(word) > 3 and word.lower() not in ['what', 'is', 'are', 'the', 'for', 'a', 'an']]
-        if keywords:
-            variants.add(' '.join(keywords))
-        if 'define' in query.lower() or 'what is' in query.lower():
-            variants.add(f"definition of {' '.join(keywords)}")
+                    len(word) > 3 and word.lower() not in ['what', 'is', 'are', 'the', 'for', 'a', 'an']];
+        if keywords: variants.add(' '.join(keywords))
+        if 'define' in query.lower() or 'what is' in query.lower(): variants.add(f"definition of {' '.join(keywords)}");
         return list(variants)
 
-    # Apply the resilience decorator to the actual API call
     @resilient_api_call()
-    async def _generate_with_resilience(self, prompt: str) -> str:
-        """A wrapper for the Gemini API call that is now decorated for resilience."""
+    async def _distill_evidence_with_resilience(self, query: str, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        if not chunks: return []
+        context_str = "\n---\n".join([f"ID: {i}\n{chunk.text}" for i, chunk in enumerate(chunks)])
+        prompt = f"""
+                You are an expert insurance analyst and a master of synthesis. Your final and only job is to synthesize the provided evidence dossier into a professional, comprehensive, and definitive answer to the user's original question.
+
+                The user's original question was:
+                <QUESTION>
+                {query}
+                </QUESTION>
+
+                Here is the evidence dossier your team has gathered:
+                <EVIDENCE>
+                {json.dumps(context_str)}
+                </EVIDENCE>
+
+                **Your Instructions for Synthesizing the Final Answer:**
+                1.  Synthesize a single, clear, and professional paragraph.
+                2.  Your answer MUST be grounded *exclusively* in the provided `<EVIDENCE>`.
+                3.  If the evidence contains specific numbers, dates, or percentages, you MUST include them in your answer.
+                4.  If the evidence contains conflicting information, state the conflict clearly (e.g., "One clause states a 30-day period, while another specifies 24 months for this condition.").
+                5.  If the evidence is empty or contains an error, you MUST state that the information could not be found in the provided policy documents.
+
+                **CRITICAL RULES OF CONDUCT:**
+                -   NEVER apologize.
+                -   NEVER ask for more information or say "Please provide the document."
+                -   NEVER break character. You are a professional analyst providing a definitive report.
+                -   NEVER mention the tools, the dossier, or your internal process (e.g., "Based on the evidence...") in your final answer. Simply state the facts.
+                """
+        response = await self.fast_model.generate_content_async(prompt)
+        best_chunk_id = int(re.search(r'\d+', response.text.strip()).group())
+        logger.info(f"DISTILLER: Identified best evidence chunk ID: {best_chunk_id}")
+        return [chunks[best_chunk_id]]
+
+    @resilient_api_call()
+    async def _synthesize_with_resilience(self, query: str, evidence: List[Dict]) -> str:
+        prompt = f"You are an expert analyst. Synthesize the provided evidence into a concise, direct, and professional answer to the user's question.\n\n**User Question:** \"{query}\"\n\n**Evidence:**\n{json.dumps(evidence, indent=2)}\n\n**Instructions:**\n- State the single most important fact directly.\n- Your answer must be one to two sentences maximum.\n- If the evidence is empty or contains an error, state that the information could not be found."
         response = await self.reasoning_model.generate_content_async(prompt)
-        # Add robust error handling for the response object
-        try:
-            return response.text.strip()
-        except (AttributeError, ValueError):
-            logger.warning("Gemini response did not contain valid text. Falling back.")
-            return "The information could not be found in the provided documents."
+        return response.text.strip()
 
     async def answer_question(self, query: str) -> Answer:
-        logger.info(f"--- Starting Lean & Resilient Analyst process for question: '{query}' ---")
+        logger.info(f"--- Starting Resilient Analyst process for question: '{query}' ---")
 
-        final_answer_key = self._get_cache_key(f"final_answer:{query}")
-        cached_answer = await self.redis.get(final_answer_key)
-        if cached_answer:
-            logger.info("CACHE HIT: Returning final answer from cache.")
-            return Answer(query=query, decision="Information Found (Cached)", payout=None, justification=[],
-                          simple_answer=cached_answer)
+        # The cache check is now removed.
 
-        # Phase 1: Broad Retrieval
         search_queries = self._deterministic_query_expansion(query)
-        all_retrieved_chunks = [chunk for sq in search_queries for chunk in self.retriever.retrieve(sq, top_k=7)]
+        all_retrieved_chunks = [chunk for sq in search_queries for chunk in self.retriever.retrieve(sq, top_k=5)]
         unique_chunks = list({chunk.chunk_id: chunk for chunk in all_retrieved_chunks}.values())
 
-        # Phase 2: One-Shot Distillation and Synthesis
-        context_str = "\n---\n".join([f"Evidence Chunk:\n{chunk.text}" for chunk in unique_chunks])
+        distilled_evidence_chunks = await self._distill_evidence_with_resilience(query, unique_chunks)
 
-        synthesis_prompt = f"""
-        You are an expert insurance analyst. Your task is to provide a direct, concise, and accurate answer to the user's question based ONLY on the provided evidence chunks.
-
-        **User Question:**
-        {query}
-
-        **Evidence Chunks (separated by '---'):**
-        <EVIDENCE>
-        {context_str}
-        </EVIDENCE>
-
-        **Instructions:**
-        1.  Carefully review all evidence chunks to find the most relevant piece of information that directly answers the user's question.
-        2.  Synthesize this information into a single, clear, and professional paragraph.
-        3.  If the evidence contains specific numbers, dates, or conditions, you MUST include them.
-        4.  If the evidence does not contain an answer, you MUST state: "The information could not be found in the provided documents."
-        5.  Your answer must be definitive. Do not apologize. Do not ask for more information. State the fact or state it is not found.
-        """
-
-        # Call the new resilient wrapper function
-        final_answer_text = await self._generate_with_resilience(synthesis_prompt)
-
-        await self.redis.set(final_answer_key, final_answer_text, ex=3600)
+        # We will simplify and make one direct synthesis call
+        if not distilled_evidence_chunks:
+            final_answer_text = "The information could not be found in the provided documents."
+        else:
+            evidence_for_synthesis = [{"evidence": chunk.text} for chunk in distilled_evidence_chunks]
+            final_answer_text = await self._synthesize_with_resilience(query, evidence_for_synthesis)
 
         logger.info(f"SYNTHESIZER: Generated final answer: {final_answer_text}")
         return Answer(query=query, decision="Information Found", payout=None, justification=[],
                       simple_answer=final_answer_text)
 
     async def answer_all_questions(self, questions: List[str]) -> List[Answer]:
-        """Processes a list of questions sequentially."""
         answers = []
         for query in questions:
             answer = await self.answer_question(query)
