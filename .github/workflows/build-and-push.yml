@@ -1,34 +1,30 @@
-# .github/workflows/build-and-push.yml
-
 name: Build and Push Docker Image to ACR
 
-# This workflow will run automatically on any push to your final submission branch.
+# This workflow runs on any push to your final submission branch
 on:
   push:
     branches: [ final-submission-version ]
-  # This also allows you to run it manually from the GitHub "Actions" tab if needed.
-  workflow_dispatch:
+  workflow_dispatch: # Allows you to run it manually from the GitHub "Actions" tab
 
 jobs:
-  build-and-deploy:
-    # GitHub will provide a standard, powerful Linux machine for the build.
-    # This completely bypasses the virtualization issue on your local machine.
-    runs-on: ubuntu-latest
+  build-and-push:
+    runs-on: ubuntu-latest # Use a standard GitHub machine for the build
 
     steps:
-    - name: 'Checkout GitHub Action'
-      # This step downloads your repository code onto the GitHub runner machine.
+    - name: 'Checkout repository code'
       uses: actions/checkout@v3
 
-    - name: 'Login to Azure'
-      # This step securely logs into Azure using the AZURE_CREDENTIALS secret you created.
-      uses: azure/login@v1
+    - name: 'Log in to Azure Container Registry'
+      # This step uses your AZURE_CREDENTIALS to log Docker into your private registry.
+      uses: azure/docker-login@v1
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        login-server: ${{ secrets.ACR_NAME }}.azurecr.io
+        username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
+        password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
 
-    - name: 'Build and push image to ACR'
-      # This is the key step. It runs the `az acr build` command on the GitHub runner.
-      # It builds the Dockerfile from your repository and pushes the resulting
-      # image directly to your Azure Container Registry.
+    - name: 'Build and push the Docker image'
+      # These are standard Docker commands that will now run on the GitHub machine.
+      # This completely bypasses the "ACR Tasks" restriction.
       run: |
-        az acr build --registry ${{ secrets.ACR_NAME }} --image hackrx-app:latest .
+        docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:latest .
+        docker push ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:latest
