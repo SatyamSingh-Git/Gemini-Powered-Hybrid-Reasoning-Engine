@@ -1,4 +1,4 @@
-# src/reasoning_engine/core/agent.py (THE FINAL, BUG-FREE, NO-CACHE VERSION)
+# src/reasoning_engine/core/agent.py (THE FINAL, BULLETPROOF VERSION)
 
 import google.generativeai as genai
 from typing import List, Dict, Any, Callable, Coroutine
@@ -24,7 +24,7 @@ def resilient_api_call(max_retries=5, initial_delay=1.0, backoff_factor=2.0, jit
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
-                    if "429" in str(e) and "ResourceExhausted" in str(e):
+                    if "429" in str(e):
                         if attempt == max_retries - 1: raise e
                         wait_time = delay + random.uniform(0, jitter)
                         logger.warning(f"Rate limit hit. Retrying in {wait_time:.2f}s...")
@@ -40,7 +40,6 @@ def resilient_api_call(max_retries=5, initial_delay=1.0, backoff_factor=2.0, jit
 
 
 class ReasoningAgent:
-    # We no longer accept a redis_client
     def __init__(self, retriever: HybridRetriever):
         self.retriever = retriever
         self.reasoning_model = genai.GenerativeModel('gemini-1.5-pro-latest')
@@ -56,49 +55,71 @@ class ReasoningAgent:
 
     @resilient_api_call()
     async def _distill_evidence_with_resilience(self, query: str, chunks: List[DocumentChunk]) -> List[DocumentChunk]:
+        """
+        Uses a fast LLM to find the single best chunk of evidence, now with
+        robust validation to prevent crashes from model hallucinations.
+        """
         if not chunks: return []
+
         context_str = "\n---\n".join([f"ID: {i}\n{chunk.text}" for i, chunk in enumerate(chunks)])
-        prompt = f"""
-                You are an expert insurance analyst and a master of synthesis. Your final and only job is to synthesize the provided evidence dossier into a professional, comprehensive, and definitive answer to the user's original question.
 
-                The user's original question was:
-                <QUESTION>
-                {query}
-                </QUESTION>
+        # A clearer, more forceful prompt
+        distillation_prompt = f"""
+        You are a research assistant. Your task is to review the following text chunks, which are separated by '---'.
+        Based on the user's question, identify the SINGLE chunk ID that contains the most direct and precise answer.
+        The valid IDs are from 0 to {len(chunks) - 1}.
+        Respond with ONLY the numeric ID of that single best chunk. Do not add any other text.
 
-                Here is the evidence dossier your team has gathered:
-                <EVIDENCE>
-                {json.dumps(context_str)}
-                </EVIDENCE>
+        User Question: "{query}"
 
-                **Your Instructions for Synthesizing the Final Answer:**
-                1.  Synthesize a single, clear, and professional paragraph.
-                2.  Your answer MUST be grounded *exclusively* in the provided `<EVIDENCE>`.
-                3.  If the evidence contains specific numbers, dates, or percentages, you MUST include them in your answer.
-                4.  If the evidence contains conflicting information, state the conflict clearly (e.g., "One clause states a 30-day period, while another specifies 24 months for this condition.").
-                5.  If the evidence is empty or contains an error, you MUST state that the information could not be found in the provided policy documents.
+        <EVIDENCE>
+        {context_str}
+        </EVIDENCE>
+        """
 
-                **CRITICAL RULES OF CONDUCT:**
-                -   NEVER apologize.
-                -   NEVER ask for more information or say "Please provide the document."
-                -   NEVER break character. You are a professional analyst providing a definitive report.
-                -   NEVER mention the tools, the dossier, or your internal process (e.g., "Based on the evidence...") in your final answer. Simply state the facts.
-                """
-        response = await self.fast_model.generate_content_async(prompt)
-        best_chunk_id = int(re.search(r'\d+', response.text.strip()).group())
-        logger.info(f"DISTILLER: Identified best evidence chunk ID: {best_chunk_id}")
-        return [chunks[best_chunk_id]]
+        response = await self.fast_model.generate_content_async(distillation_prompt)
+
+        # THE FIX IS HERE: We now validate the AI's output before using it.
+        try:
+            # Find the first number in the response and convert it to an integer
+            best_chunk_id_str = re.search(r'\d+', response.text.strip()).group()
+            best_chunk_id = int(best_chunk_id_str)
+
+            # Check if the ID is a valid index for our list
+            if 0 <= best_chunk_id < len(chunks):
+                logger.info(f"DISTILLER: Identified valid best evidence chunk ID: {best_chunk_id}")
+                return [chunks[best_chunk_id]]
+            else:
+                # The ID was a number, but it was out of bounds
+                logger.warning(
+                    f"DISTILLER: Model returned out-of-bounds ID: {best_chunk_id}. Falling back to the first chunk.")
+                return [chunks[0]]  # A safe fallback
+        except (ValueError, AttributeError, IndexError) as e:
+            # The model's response was not a number, or something else went wrong
+            logger.error(
+                f"DISTILLER: Could not parse a valid ID from model response '{response.text}'. Falling back to all chunks. Error: {e}")
+            return chunks  # The safest fallback is to use all chunks
 
     @resilient_api_call()
-    async def _synthesize_with_resilience(self, query: str, evidence: List[Dict]) -> str:
-        prompt = f"You are an expert analyst. Synthesize the provided evidence into a concise, direct, and professional answer to the user's question.\n\n**User Question:** \"{query}\"\n\n**Evidence:**\n{json.dumps(evidence, indent=2)}\n\n**Instructions:**\n- State the single most important fact directly.\n- Your answer must be one to two sentences maximum.\n- If the evidence is empty or contains an error, state that the information could not be found."
+    async def _synthesize_with_resilience(self, query: str, evidence_text: str) -> str:
+        prompt = f"""
+        You are an expert analyst. Synthesize the provided evidence into a concise, direct, and professional answer to the user's question.
+
+        **User Question:** "{query}"
+
+        **Evidence:**
+        {evidence_text}
+
+        **Instructions:**
+        - State the single most important fact from the evidence directly.
+        - Your answer must be one to two sentences maximum.
+        - If the evidence is empty, state that the information could not be found.
+        """
         response = await self.reasoning_model.generate_content_async(prompt)
         return response.text.strip()
 
     async def answer_question(self, query: str) -> Answer:
         logger.info(f"--- Starting Resilient Analyst process for question: '{query}' ---")
-
-        # The cache check is now removed.
 
         search_queries = self._deterministic_query_expansion(query)
         all_retrieved_chunks = [chunk for sq in search_queries for chunk in self.retriever.retrieve(sq, top_k=5)]
@@ -106,11 +127,11 @@ class ReasoningAgent:
 
         distilled_evidence_chunks = await self._distill_evidence_with_resilience(query, unique_chunks)
 
-        # We will simplify and make one direct synthesis call
         if not distilled_evidence_chunks:
             final_answer_text = "The information could not be found in the provided documents."
         else:
-            evidence_for_synthesis = [{"evidence": chunk.text} for chunk in distilled_evidence_chunks]
+            # We now only synthesize the single best chunk of evidence
+            evidence_for_synthesis = distilled_evidence_chunks[0].text
             final_answer_text = await self._synthesize_with_resilience(query, evidence_for_synthesis)
 
         logger.info(f"SYNTHESIZER: Generated final answer: {final_answer_text}")
