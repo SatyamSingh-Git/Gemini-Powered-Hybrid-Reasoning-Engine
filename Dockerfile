@@ -10,6 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libpoppler-cpp-dev \
     pkg-config \
     tesseract-ocr \
+    libgl1-mesa-glx\
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the requirements file into the container
