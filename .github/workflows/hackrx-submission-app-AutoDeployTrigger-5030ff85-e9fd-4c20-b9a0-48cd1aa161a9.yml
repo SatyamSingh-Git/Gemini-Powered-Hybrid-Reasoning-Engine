@@ -1,0 +1,49 @@
+name: Trigger auto deployment for hackrx-submission-app
+
+# When this action will be executed
+on:
+  # Automatically trigger it when detected changes in repo
+  push:
+    branches: 
+      [ final-submission-version ]
+    paths:
+    - '**'
+    - '.github/workflows/hackrx-submission-app-AutoDeployTrigger-5030ff85-e9fd-4c20-b9a0-48cd1aa161a9.yml'
+
+  # Allow manual trigger 
+  workflow_dispatch:      
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions: 
+      id-token: write #This is required for requesting the OIDC JWT Token
+      contents: read #Required when GH token is used to authenticate with private repo
+
+    steps:
+      - name: Checkout to the branch
+        uses: actions/checkout@v2
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.HACKRXSUBMISSIONAPP_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.HACKRXSUBMISSIONAPP_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.HACKRXSUBMISSIONAPP_AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build and push container image to registry
+        uses: azure/container-apps-deploy-action@v2
+        with:
+          appSourcePath: ${{ github.workspace }}
+          _dockerfilePathKey_: _dockerfilePath_
+          _targetLabelKey_: _targetLabel_
+          registryUrl: hackrxcontainerregistry.azurecr.io
+          registryUsername: ${{ secrets.HACKRXSUBMISSIONAPP_REGISTRY_USERNAME }}
+          registryPassword: ${{ secrets.HACKRXSUBMISSIONAPP_REGISTRY_PASSWORD }}
+          containerAppName: hackrx-submission-app
+          resourceGroup: HackRxResourceGroup
+          imageToBuild: hackrxcontainerregistry.azurecr.io/hackrx-submission-app:${{ github.sha }}
+          _buildArgumentsKey_: |
+            _buildArgumentsValues_
+
+
