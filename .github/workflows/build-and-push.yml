@@ -1,30 +1,48 @@
-name: Build and Push Docker Image to ACR
+name: Build, Push, and Deploy to Azure
 
 # This workflow runs on any push to your final submission branch
 on:
   push:
     branches: [ final-submission-version ]
-  workflow_dispatch: # Allows you to run it manually from the GitHub "Actions" tab
+  workflow_dispatch:
 
 jobs:
-  build-and-push:
-    runs-on: ubuntu-latest # Use a standard GitHub machine for the build
+  build-and-deploy:
+    runs-on: ubuntu-latest
 
     steps:
     - name: 'Checkout repository code'
       uses: actions/checkout@v3
 
+    - name: 'Set up Git short hash'
+      # This step creates a unique ID for this specific code version.
+      run: echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+
+    - name: 'Log in to Azure'
+      uses: azure/login@v1
+      with:
+        creds: ${{ secrets.AZURE_CREDENTIALS }}
+
     - name: 'Log in to Azure Container Registry'
-      # This step uses your AZURE_CREDENTIALS to log Docker into your private registry.
       uses: azure/docker-login@v1
       with:
         login-server: ${{ secrets.ACR_NAME }}.azurecr.io
         username: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientId }}
         password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
 
-    - name: 'Build and push the Docker image'
-      # These are standard Docker commands that will now run on the GitHub machine.
-      # This completely bypasses the "ACR Tasks" restriction.
+    - name: 'Build and push the Docker image with a unique tag'
+      # We now tag the image with the unique Git SHA, e.g., hackrx-app:a1b2c3d
+      # This guarantees we are always referring to a specific version.
       run: |
-        docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:latest .
-        docker push ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:latest
+        docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:${{ env.GIT_SHA }} .
+        docker push ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:${{ env.GIT_SHA }}
+
+    - name: 'Deploy to Azure Container Apps'
+      # This is the NEW and critical step. The GitHub Action itself will now
+      # run the 'update' command, forcing Azure to use the new, unique image.
+      id: deploy
+      uses: azure/container-apps-deploy-action@v1
+      with:
+        appName: hackrx-submission-app
+        resourceGroup: HackRxResourceGroup
+        imageToDeploy: ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:${{ env.GIT_SHA }}
