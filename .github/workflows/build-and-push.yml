@@ -1,6 +1,5 @@
 name: Build, Push, and Deploy to Azure
 
-# This workflow runs on any push to your final submission branch
 on:
   push:
     branches: [ final-submission-version ]
@@ -15,7 +14,6 @@ jobs:
       uses: actions/checkout@v3
 
     - name: 'Set up Git short hash'
-      # This step creates a unique ID for this specific code version.
       run: echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
 
     - name: 'Log in to Azure'
@@ -31,18 +29,15 @@ jobs:
         password: ${{ fromJson(secrets.AZURE_CREDENTIALS).clientSecret }}
 
     - name: 'Build and push the Docker image with a unique tag'
-      # We now tag the image with the unique Git SHA, e.g., hackrx-app:a1b2c3d
-      # This guarantees we are always referring to a specific version.
       run: |
         docker build -t ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:${{ env.GIT_SHA }} .
         docker push ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:${{ env.GIT_SHA }}
 
     - name: 'Deploy to Azure Container Apps'
-      # This is the NEW and critical step. The GitHub Action itself will now
-      # run the 'update' command, forcing Azure to use the new, unique image.
       id: deploy
       uses: azure/container-apps-deploy-action@v1
       with:
-        appName: hackrx-submission-app
+        # THE FIX IS HERE:
+        containerAppName: hackrx-submission-app
         resourceGroup: HackRxResourceGroup
         imageToDeploy: ${{ secrets.ACR_NAME }}.azurecr.io/hackrx-app:${{ env.GIT_SHA }}
