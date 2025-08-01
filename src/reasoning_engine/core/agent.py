@@ -62,7 +62,7 @@ class ReasoningAgent:
         self.redis = redis_client
         # CRITICAL FIX: Use the powerful 'pro' model for the main reasoning task.
         # Removed the unused 'fast_model' and the 'tools' parameter.
-        self.reasoning_model = genai.GenerativeModel('gemini-1.5-pro-latest')
+        self.reasoning_model = genai.GenerativeModel('gemini-2.5-flash')
 
     def _get_cache_key(self, content: str) -> str:
         """Creates a unique cache key for a given piece of content."""
