@@ -227,9 +227,6 @@ For larger changes, please open an issue first to discuss.
 
 ---
 
-## License
-No license file is currently included. If you intend to use or distribute this project, please add a LICENSE file (e.g., MIT, Apache‑2.0).
-
 ---
 
 ## Acknowledgments
